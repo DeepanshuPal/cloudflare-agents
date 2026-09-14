@@ -65,12 +65,7 @@ import {
 } from "agents/chat";
 import { ResumableStream, createChatStreams } from "agents/chat";
 import type { Streams } from "agents/streams";
-import {
-  Sessions,
-  type Session,
-  type SessionMessage,
-  type WriteOptions
-} from "agents/sessions";
+import { Sessions, type Session, type SessionMessage } from "agents/sessions";
 import {
   CHAT_RECOVERY_TASK_NAME,
   chatRecoveryTaskRunOptions,
@@ -6334,7 +6329,6 @@ export class AIChatAgent<
     );
 
     const toWrite: UIMessage[] = [];
-    const knownChanged = new Set<string>();
     for (const message of mergedMessages) {
       const resolved = resolveToolMergeId(
         this._sanitizeMessageForPersistence(message),
@@ -6347,12 +6341,7 @@ export class AIChatAgent<
       const prior = priorById.get(resolved.id);
       if (prior && JSON.stringify(prior) === JSON.stringify(resolved)) continue;
       toWrite.push(resolved);
-      // A message the mirror holds a different version of is a known change:
-      // Sessions can rewrite the row without reading it back first.
-      if (prior) knownChanged.add(resolved.id);
     }
-    const writeOptions = (message: UIMessage): WriteOptions =>
-      knownChanged.has(message.id) ? { compare: "none" } : {};
     // The cutover: a persist that carries the finished turn's message
     // lands every changed message in the same transaction that settles the
     // stream and drops its rows. A persist of other messages (an override
@@ -6372,7 +6361,7 @@ export class AIChatAgent<
           cutover.streamId,
           () => {
             for (const message of toWrite)
-              afters.push(sync.upsert(message, writeOptions(message)).after);
+              afters.push(sync.upsert(message).after);
           },
           { discard: cutover.discard }
         );
@@ -6384,8 +6373,7 @@ export class AIChatAgent<
       }
       for (const after of afters) await after();
     } else {
-      for (const message of toWrite)
-        await this.#session.upsertMessage(message, writeOptions(message));
+      for (const message of toWrite) await this.#session.upsertMessage(message);
     }
 
     // Regeneration can submit a strict subset of the server transcript. Keep
@@ -6731,12 +6719,8 @@ export class AIChatAgent<
         });
         // The change feed patches `this.messages`. A `null` result means the
         // row is not in storage (nothing to mirror), so patch the live view
-        // directly to keep the in-memory transcript consistent. The part
-        // compare above already established a real change, so Sessions
-        // skips its own read-back.
-        const stored = await this.#session.updateMessage(updatedMessage, {
-          compare: "none"
-        });
+        // directly to keep the in-memory transcript consistent.
+        const stored = await this.#session.updateMessage(updatedMessage);
         if (!stored) {
           const index = this.messages.findIndex(
             (candidate) => candidate.id === updatedMessage.id
