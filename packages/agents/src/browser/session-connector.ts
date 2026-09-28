@@ -134,6 +134,12 @@ export class BrowserSessionConnector extends CodemodeConnector {
   readonly #session: string;
   #states = new Map<string, ExecutionState>();
   #connecting = new Map<string, Promise<ExecutionState>>();
+  /**
+   * In memory, on this instance. An execution resumed after an approval
+   * pause may run on a fresh connector, whose report starts over. Nothing
+   * pauses today — the browser tool wires no approval tools — so reporting
+   * across a resume is left for when approvals are added.
+   */
   #reports = new Map<string, BrowserExecutionReport>();
 
   constructor(
@@ -325,7 +331,8 @@ export class BrowserSessionConnector extends CodemodeConnector {
 
   /**
    * Take (and forget) what happened to the browser during an execution.
-   * `undefined` when the execution never touched the browser.
+   * `undefined` when the execution never touched the browser. Covers the
+   * passes this instance ran; see the note on `#reports`.
    */
   takeReport(executionId: string): BrowserExecutionReport | undefined {
     const report = this.#reports.get(executionId);
@@ -540,6 +547,13 @@ export class BrowserSessionConnector extends CodemodeConnector {
       state.attached.delete(targetId);
       // The next "active" use picks a tab afresh.
       if (state.activeTargetId === targetId) state.activeTargetId = undefined;
+    } else if (method === "Target.detachFromTarget") {
+      // Forget a session the model detached, so the next use reattaches.
+      for (const [target, live] of state.attached) {
+        if (target === targetId || live === params?.sessionId) {
+          state.attached.delete(target);
+        }
+      }
     }
   }
 

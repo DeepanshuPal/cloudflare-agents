@@ -95,7 +95,22 @@ class FakeBrowserInstance {
         this.attached.set(sessionId, String(params.targetId));
         return { result: { sessionId } };
       }
+      case "Target.detachFromTarget":
+        for (const [sessionId, targetId] of this.attached) {
+          if (sessionId === params.sessionId || targetId === params.targetId) {
+            this.attached.delete(sessionId);
+          }
+        }
+        return { result: {} };
       default:
+        if (command.sessionId && !this.attached.has(command.sessionId)) {
+          return {
+            error: {
+              code: -32001,
+              message: `Session with given id not found.`
+            }
+          };
+        }
         // Page-scoped commands without a session fail like Chrome does.
         if (!command.method.startsWith("Target.") && !command.sessionId) {
           return {
@@ -416,6 +431,23 @@ describe("BrowserSessionConnector", () => {
       (command) => command.method === "Target.attachToTarget"
     );
     expect(attaches).toHaveLength(1);
+  });
+
+  it("reattaches after the model detaches from the active tab", async () => {
+    const t = setup();
+    const { results, error } = await t.run([
+      evaluateActive,
+      [
+        "send",
+        {
+          method: "Target.detachFromTarget",
+          params: { targetId: "target-1" }
+        }
+      ],
+      evaluateActive
+    ]);
+    expect(error).toBeUndefined();
+    expect(evaluatedIn(results[2])).toBe("target-1");
   });
 
   it("reports tabs the page opened as newTabs without switching to them", async () => {

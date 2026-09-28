@@ -160,12 +160,16 @@ export class CdpSession {
     try {
       this.#socket.send(JSON.stringify({ id, method, params, sessionId }));
     } catch (error) {
-      // A closed socket throws on send: fail this command now, rather than
-      // leave it pending to time out or reject later with no one listening.
+      // A closed socket throws on send: fail this command now rather than
+      // leave it pending until it times out.
       const pending = this.#pending.get(id);
-      if (pending) clearTimeout(pending.timeoutId);
-      this.#pending.delete(id);
-      return Promise.reject(error);
+      if (pending) {
+        clearTimeout(pending.timeoutId);
+        this.#pending.delete(id);
+        pending.reject(
+          error instanceof Error ? error : new Error(String(error))
+        );
+      }
     }
     return result;
   }

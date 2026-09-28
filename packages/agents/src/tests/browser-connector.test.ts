@@ -387,6 +387,18 @@ describe("CdpSession construction", () => {
     session.close();
     expect(closed).toBe(1);
   });
+
+  it("rejects a command straight away when the socket refuses to send", async () => {
+    const socket = silentSocket();
+    socket.send = () => {
+      throw new Error("WebSocket is closed");
+    };
+    const session = new CdpSession(socket, { timeoutMs: 60_000 });
+
+    await expect(session.send("Page.enable")).rejects.toThrow(
+      "WebSocket is closed"
+    );
+  });
 });
 
 describe("Kitesurf Browser Run connections", () => {

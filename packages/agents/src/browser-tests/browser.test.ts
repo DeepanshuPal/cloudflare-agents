@@ -690,6 +690,31 @@ describe("browser connector e2e", () => {
       expect(output.error).toContain("CDP *event*");
     });
 
+    it("reattaches after the model detaches from the active tab", async () => {
+      await runNamed(setTitle("detached"));
+      const output = await runNamed(`async () => {
+        const { targetInfos } = await cdp.send({ method: "Target.getTargets" });
+        await cdp.send({
+          method: "Runtime.evaluate",
+          params: { expression: "1" },
+          sessionId: "active"
+        });
+        const page = targetInfos.find((t) => t.type === "page" && t.title === "detached");
+        await cdp.send({
+          method: "Target.detachFromTarget",
+          params: { targetId: page.targetId }
+        });
+        const { result } = await cdp.send({
+          method: "Runtime.evaluate",
+          params: { expression: "document.title", returnByValue: true },
+          sessionId: "active"
+        });
+        return result.value;
+      }`);
+      expect(output.status).toBe("completed");
+      expect(output.result).toBe("detached");
+    });
+
     it("refuses to close the browser", async () => {
       await runNamed(setTitle("survivor"));
       const output = await runNamed(`async () => {
