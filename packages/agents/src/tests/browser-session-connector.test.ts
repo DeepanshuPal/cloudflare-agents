@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { BrowserSessionConnector } from "../browser/session-connector";
 import {
   NamedBrowserSessions,
@@ -133,6 +133,8 @@ class FakeSocket {
     this.#listeners.set(type, list);
   }
   send(data: string): void {
+    // Like a real WebSocket, a closed socket refuses to send.
+    if (this.closed) throw new Error("WebSocket is closed");
     const command = JSON.parse(data) as SentCommand;
     this.sent.push(command);
     queueMicrotask(() => {
@@ -221,6 +223,19 @@ function setup() {
   });
   let executions = 0;
 
+  /** Run `calls` as one pass of `executionId`, without taking its report. */
+  async function pass(
+    executionId: string,
+    calls: Array<[tool: string, args: Record<string, unknown>]>
+  ) {
+    const results: unknown[] = [];
+    for (const [tool, args] of calls) {
+      results.push(await connector.executeTool(tool, args, { executionId }));
+    }
+    await connector.onPassEnd(executionId);
+    return results;
+  }
+
   /** Run `calls` as one execution (one pass) and return its report. */
   async function run(
     calls: Array<[tool: string, args: Record<string, unknown>]>
@@ -235,7 +250,7 @@ function setup() {
     } catch (caught) {
       error = caught;
     }
-    await connector.onPassEnd(executionId, error ? "error" : "completed");
+    await connector.onPassEnd(executionId);
     return { results, error, report: connector.takeReport(executionId) };
   }
 
@@ -256,6 +271,7 @@ function setup() {
     store,
     sessions,
     connector,
+    pass,
     run,
     stored,
     instance,
@@ -268,6 +284,16 @@ const evaluateActive: [string, Record<string, unknown>] = [
   {
     method: "Runtime.evaluate",
     params: { expression: "1" },
+    sessionId: "active"
+  }
+];
+
+/** Make the active page open a popup tab. */
+const openPopup: [string, Record<string, unknown>] = [
+  "send",
+  {
+    method: "Runtime.evaluate",
+    params: { expression: "openPopup()" },
     sessionId: "active"
   }
 ];
@@ -290,6 +316,7 @@ describe("BrowserSessionConnector", () => {
       "spec"
     ]);
     expect(description.instructions).toContain('sessionId: "active"');
+    expect(description.instructions).toContain("restarted: true");
   });
 
   it('routes "active" to the only open tab and remembers it', async () => {
@@ -393,20 +420,82 @@ describe("BrowserSessionConnector", () => {
 
   it("reports tabs the page opened as newTabs without switching to them", async () => {
     const t = setup();
-    const { report } = await t.run([
-      [
-        "send",
-        {
-          method: "Runtime.evaluate",
-          params: { expression: "openPopup()" },
-          sessionId: "active"
-        }
-      ]
-    ]);
+    const { report } = await t.run([openPopup]);
     expect(report?.newTabs).toEqual([
       { targetId: "target-2", url: "https://popup.example/" }
     ]);
     expect(t.stored()?.activeTargetId).toBe("target-1");
+  });
+
+  it("keeps popups from earlier passes of a resumed execution", async () => {
+    const t = setup();
+    // The first pass opens a popup, then pauses for approval.
+    await t.pass("exec-resumed", [openPopup]);
+    await t.pass("exec-resumed", [evaluateActive]);
+
+    expect(t.connector.takeReport("exec-resumed")?.newTabs).toEqual([
+      { targetId: "target-2", url: "https://popup.example/" }
+    ]);
+  });
+
+  it("drops a popup that closed before the execution ended", async () => {
+    const t = setup();
+    await t.pass("exec-resumed", [openPopup]);
+    await t.pass("exec-resumed", [
+      [
+        "send",
+        { method: "Target.closeTarget", params: { targetId: "target-2" } }
+      ]
+    ]);
+
+    expect(t.connector.takeReport("exec-resumed")?.newTabs).toEqual([]);
+  });
+
+  it("saves a tab switch even if the socket drops before the pass ends", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const t = setup();
+      (await t.start()).addTab("https://other.example/");
+      await t.connector.executeTool(
+        "attachToTarget",
+        { targetId: "target-2" },
+        { executionId: "exec-drop" }
+      );
+      // Browser Run drops the socket; the browser itself lives on.
+      t.sockets[0].close();
+      await t.connector.onPassEnd("exec-drop");
+
+      expect(t.stored()?.activeTargetId).toBe("target-2");
+      expect(warn).toHaveBeenCalledOnce();
+      const { results } = await t.run([evaluateActive]);
+      expect(evaluatedIn(results[0])).toBe("target-2");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("refuses commands that would end the browser", async () => {
+    const t = setup();
+    const { error } = await t.run([["send", { method: "Browser.close" }]]);
+    expect(String(error)).toContain("managed for you");
+    expect(t.sockets).toHaveLength(0);
+  });
+
+  it("shares one connection between concurrent first calls", async () => {
+    const t = setup();
+    const executionId = "exec-parallel";
+    await Promise.all([
+      t.connector.executeTool(evaluateActive[0], evaluateActive[1], {
+        executionId
+      }),
+      t.connector.executeTool(
+        "send",
+        { method: "Target.getTargets" },
+        { executionId }
+      )
+    ]);
+    await t.connector.onPassEnd(executionId);
+    expect(t.sockets).toHaveLength(1);
   });
 
   it("picks a tab afresh after the active tab is closed", async () => {

@@ -2,12 +2,14 @@ import {
   CodemodeConnector,
   type ConnectorTool,
   type ConnectorTools,
-  type ExecutionEndStatus,
-  type PassEndStatus,
   type ToolExecuteContext
 } from "@cloudflare/codemode";
 import { validateConnectorArgs } from "./connector-validation";
-import type { CdpSession } from "./cdp-session";
+import {
+  CDP_METHOD_NOT_FOUND,
+  CdpProtocolError,
+  type CdpSession
+} from "./cdp-session";
 import type { ConnectedBrowserSession } from "./session-core";
 import { DEFAULT_BROWSER_SESSION_NAME } from "./session-core";
 import type { SearchableCdpSpec } from "./spec";
@@ -59,8 +61,27 @@ const ATTACH_HANDLE_PREFIX = "target:";
 /** Reports awaiting their tool call; bounded in case a caller never reads. */
 const MAX_PENDING_REPORTS = 100;
 
+/**
+ * Commands that would end the browser. The host owns its lifetime, so the
+ * model can't close it out from under the session (and lose its logins).
+ */
+const BROWSER_LIFETIME_COMMANDS = new Set([
+  "Browser.close",
+  "Browser.crash",
+  "Browser.crashGpuProcess"
+]);
+
+/** A CDP target id — for this connector, a tab. */
+type TargetId = string & { readonly __brand: "TargetId" };
+
+/** A CDP session id from `Target.attachToTarget`, valid on one socket only. */
+type LiveSessionId = string & { readonly __brand: "LiveSessionId" };
+
+/** The stable `sessionId` handle `cdp.attachToTarget` gives the model. */
+type AttachHandle = `${typeof ATTACH_HANDLE_PREFIX}${string}`;
+
 interface TargetInfo {
-  targetId: string;
+  targetId: TargetId;
   type: string;
   url?: string;
   title?: string;
@@ -69,20 +90,21 @@ interface TargetInfo {
 /** Per-execution state for one pass. Dropped when the pass ends. */
 interface ExecutionState {
   connected: ConnectedBrowserSession;
-  /** Live CDP session id per target, valid on this socket only. */
-  attached: Map<string, string>;
+  /** Live CDP session per target, valid on this socket only. */
+  attached: Map<TargetId, LiveSessionId>;
   /** Page targets open when the pass connected. */
-  initialPages: Set<string>;
+  initialPages: Set<TargetId>;
   /** Pages the agent itself created this pass. */
-  createdPages: Set<string>;
+  createdPages: Set<TargetId>;
   /** The tab `"active"` resolves to — decided lazily on first use. */
-  activeTargetId?: string;
+  activeTargetId?: TargetId;
   /** Whether {@link activeTargetId} was decided (vs. never needed). */
   activeResolved: boolean;
 }
 
 const INSTRUCTIONS = [
   "This browser persists between executions: tabs, cookies, and logins you leave behind are still there next time. It is managed for you — there is nothing to start, close, or reset.",
+  "The browser can still be replaced between runs (idle timeout, crash) — even between the passes of a run that paused for approval. The tool result then says restarted: true, and earlier tabs, cookies, and logins are gone. Don't assume a page from an earlier run is still there: check where you are before an action that matters (submitting a form, making a purchase).",
   'Page-scoped commands (Page.*, Runtime.*, DOM.*, Input.*, Network.*, Emulation.*) need sessionId: "active" — the tab you are working in, which stays the same across executions. Example: await cdp.send({ method: "Page.navigate", params: { url }, sessionId: "active" }).',
   "Browser- and Target-scoped commands (Target.getTargets, Target.createTarget, Browser.getVersion) take no sessionId.",
   'Opening a tab with Target.createTarget makes it the active tab. To switch to another open tab, call cdp.attachToTarget({ targetId }): it becomes active, and the returned sessionId works like "active" for that tab.',
@@ -170,6 +192,13 @@ export class BrowserSessionConnector extends CodemodeConnector {
             sessionId?: string;
             timeoutMs?: number;
           };
+          if (BROWSER_LIFETIME_COMMANDS.has(method)) {
+            throw new Error(
+              `${method} is not available: this browser is managed for you ` +
+                `and persists between runs. To close a tab, send ` +
+                `Target.closeTarget with its targetId.`
+            );
+          }
           const state = await this.#state(this.#executionId(ctx));
           const live = await this.#resolveSessionId(state, sessionId);
           let result: unknown;
@@ -212,13 +241,14 @@ export class BrowserSessionConnector extends CodemodeConnector {
         },
         execute: async (args, ctx) => {
           const { targetId, timeoutMs } = args as {
-            targetId: string;
+            targetId: TargetId;
             timeoutMs?: number;
           };
           const state = await this.#state(this.#executionId(ctx));
           await this.#attach(state, targetId, timeoutMs);
           this.#setActive(state, targetId);
-          return { sessionId: `${ATTACH_HANDLE_PREFIX}${targetId}` };
+          const handle: AttachHandle = `${ATTACH_HANDLE_PREFIX}${targetId}`;
+          return { sessionId: handle };
         }
       },
 
@@ -242,7 +272,9 @@ export class BrowserSessionConnector extends CodemodeConnector {
           properties: {
             limit: {
               type: "number",
-              description: "Max entries to return (default 50)"
+              minimum: 1,
+              description:
+                "Max entries to return, newest last (default 50; only the last 400 are kept)"
             }
           }
         },
@@ -265,51 +297,26 @@ export class BrowserSessionConnector extends CodemodeConnector {
     };
   }
 
-  // ── Lifecycle hooks ──────────────────────────────────────────────────────
+  // ── Codemode execution hooks ─────────────────────────────────────────────
 
   /**
    * The pass is over: note tabs the page opened, save the active tab on the
    * session record, and drop the socket. The browser stays alive.
    */
-  override async onPassEnd(
-    executionId: string,
-    _status: PassEndStatus
-  ): Promise<void> {
+  override async onPassEnd(executionId: string): Promise<void> {
     const state = this.#states.get(executionId);
     if (!state) return;
     this.#states.delete(executionId);
     try {
-      const pages = await this.#pages(state.connected.cdp);
-      const open = new Set(pages.map((page) => page.targetId));
-      const report = this.#report(executionId, state.connected.restarted);
-      report.newTabs = pages
-        .filter(
-          (page) =>
-            !state.initialPages.has(page.targetId) &&
-            !state.createdPages.has(page.targetId)
-        )
-        .map(({ targetId, url, title }) => ({ targetId, url, title }));
-
-      // Save the tab this pass settled on; forget one that has since closed.
-      const stored = state.connected.activeTargetId;
-      const candidate = state.activeResolved ? state.activeTargetId : stored;
-      const active = candidate && open.has(candidate) ? candidate : undefined;
-      if (active !== stored) await state.connected.setActiveTarget(active);
-    } catch (error) {
-      console.warn(
-        `[agents/browser] Failed to record tab state for browser session "${this.#session}"`,
-        error
-      );
+      const open = await this.#recordNewTabs(executionId, state);
+      await this.#saveActiveTarget(state, open);
     } finally {
       state.connected.cdp.disconnect();
     }
   }
 
   /** Nothing per execution outlives the pass; the named browser persists. */
-  override async disposeExecution(
-    executionId: string,
-    _status: ExecutionEndStatus
-  ): Promise<void> {
+  override async disposeExecution(executionId: string): Promise<void> {
     const state = this.#states.get(executionId);
     if (!state) return;
     this.#states.delete(executionId);
@@ -387,6 +394,67 @@ export class BrowserSessionConnector extends CodemodeConnector {
     return report;
   }
 
+  /**
+   * Add tabs the page opened this pass to the execution's report, and drop
+   * earlier ones that have since closed: `newTabs` lists page-opened tabs
+   * still open when the execution ends, across every pass. Returns the open
+   * tabs, or `undefined` when the browser couldn't be asked.
+   */
+  async #recordNewTabs(
+    executionId: string,
+    state: ExecutionState
+  ): Promise<Set<TargetId> | undefined> {
+    let pages: TargetInfo[];
+    try {
+      pages = await this.#pages(state.connected.cdp);
+    } catch (error) {
+      this.#warn("list the open tabs", error);
+      return undefined;
+    }
+    const report = this.#report(executionId, state.connected.restarted);
+    const opened = new Set<string>(report.newTabs.map((tab) => tab.targetId));
+    for (const page of pages) {
+      if (
+        !state.initialPages.has(page.targetId) &&
+        !state.createdPages.has(page.targetId)
+      ) {
+        opened.add(page.targetId);
+      }
+    }
+    report.newTabs = pages
+      .filter((page) => opened.has(page.targetId))
+      .map(({ targetId, url, title }) => ({ targetId, url, title }));
+    return new Set(pages.map((page) => page.targetId));
+  }
+
+  /**
+   * Save the tab this pass settled on, forgetting one that has since closed.
+   * Without the list of open tabs, save the choice unchecked: the next
+   * execution checks the stored tab is still open before using it.
+   */
+  async #saveActiveTarget(
+    state: ExecutionState,
+    open: Set<TargetId> | undefined
+  ): Promise<void> {
+    const stored = state.connected.activeTargetId as TargetId | undefined;
+    const candidate = state.activeResolved ? state.activeTargetId : stored;
+    const active =
+      candidate && (!open || open.has(candidate)) ? candidate : undefined;
+    if (active === stored) return;
+    try {
+      await state.connected.setActiveTarget(active);
+    } catch (error) {
+      this.#warn("save the active tab", error);
+    }
+  }
+
+  #warn(action: string, error: unknown): void {
+    console.warn(
+      `[agents/browser] Failed to ${action} for browser session "${this.#session}"`,
+      error
+    );
+  }
+
   async #pages(cdp: CdpSession): Promise<TargetInfo[]> {
     const result = (await cdp.send("Target.getTargets")) as {
       targetInfos?: TargetInfo[];
@@ -397,14 +465,15 @@ export class BrowserSessionConnector extends CodemodeConnector {
   async #resolveSessionId(
     state: ExecutionState,
     sessionId: string | undefined
-  ): Promise<string | undefined> {
+  ): Promise<LiveSessionId | undefined> {
     if (sessionId === ACTIVE_PAGE_SESSION) {
       return this.#attach(state, await this.#activeTarget(state));
     }
-    if (sessionId?.startsWith(ATTACH_HANDLE_PREFIX)) {
-      return this.#attach(state, sessionId.slice(ATTACH_HANDLE_PREFIX.length));
+    if (isAttachHandle(sessionId)) {
+      return this.#attach(state, targetOfHandle(sessionId));
     }
-    return sessionId; // omitted, or a raw CDP session id
+    // Omitted, or a raw CDP session id the model got from send().
+    return sessionId as LiveSessionId | undefined;
   }
 
   /**
@@ -412,7 +481,7 @@ export class BrowserSessionConnector extends CodemodeConnector {
    * is still open, else the only open tab, else a new blank tab when none
    * are open, else the first listed tab.
    */
-  async #activeTarget(state: ExecutionState): Promise<string> {
+  async #activeTarget(state: ExecutionState): Promise<TargetId> {
     if (state.activeTargetId) return state.activeTargetId;
     const pages = await this.#pages(state.connected.cdp);
     const stored = state.connected.activeTargetId;
@@ -420,7 +489,7 @@ export class BrowserSessionConnector extends CodemodeConnector {
     if (!targetId && pages.length === 0) {
       const created = (await state.connected.cdp.send("Target.createTarget", {
         url: "about:blank"
-      })) as { targetId: string };
+      })) as { targetId: TargetId };
       targetId = created.targetId;
       state.createdPages.add(targetId);
     }
@@ -429,21 +498,21 @@ export class BrowserSessionConnector extends CodemodeConnector {
     return targetId;
   }
 
-  #setActive(state: ExecutionState, targetId: string | undefined): void {
+  #setActive(state: ExecutionState, targetId: TargetId | undefined): void {
     state.activeTargetId = targetId;
     state.activeResolved = true;
   }
 
   async #attach(
     state: ExecutionState,
-    targetId: string,
+    targetId: TargetId,
     timeoutMs?: number
-  ): Promise<string> {
+  ): Promise<LiveSessionId> {
     const existing = state.attached.get(targetId);
     if (existing) return existing;
-    const live = await state.connected.cdp.attachToTarget(targetId, {
+    const live = (await state.connected.cdp.attachToTarget(targetId, {
       timeoutMs
-    });
+    })) as LiveSessionId;
     state.attached.set(targetId, live);
     return live;
   }
@@ -456,12 +525,14 @@ export class BrowserSessionConnector extends CodemodeConnector {
     result: unknown
   ): void {
     const targetId =
-      typeof params?.targetId === "string" ? params.targetId : undefined;
+      typeof params?.targetId === "string"
+        ? (params.targetId as TargetId)
+        : undefined;
     if (method === "Target.createTarget") {
       const created = (result as { targetId?: unknown } | undefined)?.targetId;
       if (typeof created === "string") {
-        state.createdPages.add(created);
-        this.#setActive(state, created);
+        state.createdPages.add(created as TargetId);
+        this.#setActive(state, created as TargetId);
       }
     } else if (method === "Target.attachToTarget" && targetId) {
       this.#setActive(state, targetId);
@@ -482,8 +553,12 @@ export class BrowserSessionConnector extends CodemodeConnector {
     method: string,
     sessionId: string | undefined
   ): Promise<unknown> {
-    if (!(error instanceof Error) || !/-32601|wasn't found/.test(error.message))
+    if (
+      !(error instanceof CdpProtocolError) ||
+      error.code !== CDP_METHOD_NOT_FOUND
+    ) {
       return error;
+    }
     if (await this.#isEvent(state, method)) {
       return new Error(
         `${error.message}. '${method}' is a CDP *event*, not a command — it ` +
@@ -512,4 +587,14 @@ export class BrowserSessionConnector extends CodemodeConnector {
       return false;
     }
   }
+}
+
+function isAttachHandle(
+  sessionId: string | undefined
+): sessionId is AttachHandle {
+  return sessionId?.startsWith(ATTACH_HANDLE_PREFIX) ?? false;
+}
+
+function targetOfHandle(handle: AttachHandle): TargetId {
+  return handle.slice(ATTACH_HANDLE_PREFIX.length) as TargetId;
 }
