@@ -32,12 +32,12 @@ A `LifecycleCapability` (id `"browser"`) composable onto an `Agent` subclass or 
 - Schedules nothing: no Lifecycle jobs, alarms, or hooks. An object with browser sessions is never woken on their behalf.
 - Host-only observability: `sessions()` lists named sessions that currently own a browser, with timestamps and a `live` / `expired` status. `expired` means no recorded activity for a full `keep_alive` window, so the platform has most likely reclaimed the browser; it is a best guess, because a human driving the browser through Live View keeps it alive without updating the record. Closed names are not listed. `liveView(name, { mode })` creates fresh Live View URLs (valid ~5 minutes to connect, never persisted) for a live named session and returns `undefined` for absent, closed, or dead ones. Creating a link counts as activity, and a link that loses a race with `close` reports the session gone rather than returning dead URLs. The Live View helpers live in `browser/live-view.ts`, shared with the connector.
 
-When `BrowserSessions` is exported (planned once the Lifecycle API firms up and the capability is in use), this is the example destined for `docs/agents/lifecycle.md` § Reusable capabilities, in that page's install style:
+Usage, in the install style of `docs/agents/lifecycle.md` § Reusable capabilities (where this example belongs once the user-facing docs cover the capability):
 
 ```ts
 import { DurableObject } from "cloudflare:workers";
 import { Lifecycle } from "agents/lifecycle";
-import { BrowserSessions } from "agents/browser"; // once exported
+import { BrowserSessions } from "agents/browser";
 
 export class ResearchObject extends DurableObject<Env> {
   readonly browser = new BrowserSessions({
@@ -69,7 +69,7 @@ On an `Agent` subclass the only difference is installation — the Agent already
 - **Raw CDP remains the model interaction surface.** A typed verb API was prototyped and parked until evaluations can show it beats raw CDP (see the `park/browser-interaction-contract` branch).
 - **Session identity is host-named, not model-promoted.** The connector's `dynamic` mode let the model promote a session; here the host wires a name and the core owns attachment. Recreation is loud (`restarted`), never silent.
 - **Browser Run owns idle reclamation.** An earlier version swept idle sessions from a Lifecycle job. It duplicated `keep_alive`, woke idle objects, needed its own crash-recovery and race handling, and could delete a browser a human was driving through Live View, since that traffic bypasses the host. Dead-browser detection in `resolve` already covers correctness.
-- **The connector is untouched.** Its `reuse`/`dynamic` modes overlap the session core for now; the overlap is bounded and resolves when the model surface moves onto the core.
+- **The original connector is untouched.** `createBrowserExecuteTool` puts the model on the session core; `BrowserConnector`'s `reuse`/`dynamic` modes still overlap it. The overlap is bounded and resolves if `createBrowserTools` moves onto the core too.
 
 ## Tradeoffs
 
