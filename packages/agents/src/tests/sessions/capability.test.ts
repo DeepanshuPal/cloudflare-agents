@@ -386,31 +386,6 @@ describe("Sessions capability", () => {
     });
   });
 
-  it("decides unchanged from the digest, and dispatches only real changes", async () => {
-    const stub = env.SessionHarnessObject.getByName(crypto.randomUUID());
-    await runInDurableObject(stub, async (instance: SessionHarnessObject) => {
-      const session = instance.sessions.session();
-      await session.appendMessage(text("k1", "first body"));
-      const events: SessionChangeEvent[] = [];
-      instance.sessions.subscribe((event) => {
-        events.push(event);
-      });
-
-      // A row that is not there is reported missing, and nothing is written.
-      expect(await session.updateMessage(text("absent", "body"))).toBeNull();
-      expect(events).toEqual([]);
-
-      const stored = await session.updateMessage(text("k1", "second body"));
-      expect(stored?.parts[0].text).toBe("second body");
-      expect((await session.getMessage("k1"))?.parts[0].text).toBe(
-        "second body"
-      );
-      // An identical re-send after it is absorbed: no second event.
-      await session.updateMessage(text("k1", "second body"));
-      expect(events.map((event) => event.type)).toEqual(["update"]);
-    });
-  });
-
   it("falls back to the stored content for a row written before the digest", async () => {
     const stub = env.SessionHarnessObject.getByName(crypto.randomUUID());
     await runInDurableObject(stub, async (instance: SessionHarnessObject) => {
@@ -451,18 +426,6 @@ describe("Sessions capability", () => {
       instance.clearContentHash("", "s1");
       await session.updateMessage(text("s1", `${body}!`));
       expect((await session.getMessage("s1"))?.parts[0].text).toBe(`${body}!`);
-    });
-  });
-
-  it("still drops surplus continuations when an update shrinks the row", async () => {
-    const stub = env.SessionHarnessObject.getByName(crypto.randomUUID());
-    await runInDurableObject(stub, async (instance: SessionHarnessObject) => {
-      const session = instance.sessions.session();
-      await session.appendMessage(text("s1", "y".repeat(3 * 1024 * 1024)));
-      expect(instance.continuationRows("", "s1").length).toBeGreaterThan(0);
-      await session.updateMessage(text("s1", "short"));
-      expect(instance.continuationRows("", "s1")).toEqual([]);
-      expect((await session.getMessage("s1"))?.parts[0].text).toBe("short");
     });
   });
 

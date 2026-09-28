@@ -83,15 +83,8 @@ type PathTokens = {
 export type UpdateOutcome = "missing" | "unchanged" | "updated";
 
 /**
- * Digest of a message's stored form, stamped on the row by the write that
- * produced it. An update compares digests instead of reassembling the stored
- * content, so deciding "unchanged" costs the key-side probe it was already
- * doing and never reads a continuation row. Derived from the content at
- * write time on a row that is being written anyway — nothing to maintain.
- *
- * Rows written before the column existed (and rows lifted by the legacy
- * migration) carry `null`, and those fall back to the byte-exact read-back;
- * the next update of such a row stamps its digest.
+ * Digest of a message's stored form, stamped on the row by every write, so an
+ * update can decide "unchanged" without reading the stored content back.
  */
 function contentDigest(json: string): string {
   return createHash("sha256").update(json, "utf8").digest("hex");
@@ -174,10 +167,9 @@ export class SessionsCore {
   }
 
   /**
-   * Additive column migration for objects whose message table predates the
-   * digest. Nullable with no default, so existing rows are untouched and no
-   * backfill pass runs: a `null` digest means "compare by reading the row
-   * back", and the next update of that row stamps one.
+   * Add the digest column to a message table that predates it. Nullable, so
+   * no existing row is rewritten; a `null` digest falls back to reading the
+   * row back once.
    */
   #addMessageContentHashColumn(): void {
     const columns = this.io
@@ -1039,25 +1031,19 @@ export class SessionsCore {
   /**
    * Durable update of an existing row. An identical row writes nothing: no
    * row, no continuation, no FTS, no event. The no-op guard compares the
-   * FULL content, not just the slice the message row holds — it does that
-   * against the digest the last write stamped on the row, so the decision
-   * costs the key-side probe it was making anyway and never reads the
-   * payload or a continuation row. A row whose digest is `null` predates the
-   * column (or was lifted by the legacy migration): it falls back once to
-   * reassembling the stored content, and is stamped either way, so it pays
-   * that fallback at most once.
+   * FULL content, through the digest the last write stamped, so neither the
+   * payload nor a continuation row is read. A row without a digest compares
+   * the reassembled content once and is stamped.
    */
   update(
     sessionId: string,
     message: SessionMessage,
     tokenEstimate: number
   ): UpdateOutcome {
-    // Key-side columns only: the continuation count the surplus delete
-    // needs, the estimate the path total was counting, and the digest the
-    // change decision compares against. The payload stays in SQLite.
+    // Key-side columns only; the payload stays in SQLite.
     const oldRows = this.io.sql<{
       content_chunks: number;
-      token_estimate: number | null;
+      token_estimate: number;
       content_hash: string | null;
     }>(
       "SELECT content_chunks, token_estimate, content_hash FROM cf_agents_session_messages WHERE session_id = ? AND id = ?",
@@ -1073,9 +1059,8 @@ export class SessionsCore {
     if (old.content_hash !== null) {
       if (old.content_hash === digest) return "unchanged";
     } else if (this.#content(sessionId, message.id) === json) {
-      // Undigested and byte-identical. Stamp the digest so this row stops
-      // paying the read-back; nothing else about the row moves, so this is
-      // still an `unchanged` outcome with no continuation, FTS, or event.
+      // Byte-identical: stamp the digest so this row stops paying the
+      // read-back. Still `unchanged`: no continuation, FTS, or event.
       this.io.sqlWrite(
         "UPDATE cf_agents_session_messages SET content_hash = ? WHERE session_id = ? AND id = ?",
         [digest, sessionId, message.id]
